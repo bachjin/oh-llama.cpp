@@ -1,0 +1,232 @@
+{
+    "wrong_pairs":    [
+
+  ],
+    "pairs":[
+
+
+         {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 128256},
+            "name": "result_output"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-0"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-1"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-2"
+        },
+
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-3"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-4"
+        },
+        
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-5"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-6"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-7"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-8"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-9"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-10"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-11"
+        },
+        {
+            "src0": { "row": 1, "col": 8192},
+            "src1": { "row": 8192, "col": 2048},
+            "name": "ffn_out-12"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-0"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-1"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-2"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-3"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-4"
+        },
+
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-1"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-2"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-3"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-4"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-5"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-6"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-7"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-8"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-9"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-10"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-11"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_up-12"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-0"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-1"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-2"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-3"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-4"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-5"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-6"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-7"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-8"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-9"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-10"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-11"
+        },
+        {
+            "src0": { "row": 1, "col": 2048},
+            "src1": { "row": 2048, "col": 8192},
+            "name": "ffn_gate-12"
+        }
+   ]
+}
