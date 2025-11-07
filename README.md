@@ -1,5 +1,15 @@
 # oh-llama.cpp
 
+## TL;DR
+
+`hdc.sh` contains the script to build and deploy llama.cpp with rknn backend on OpenHarmony device. 
+
+requires: `wget`, `tar`, `git`, `hdc`.
+
+`hdc.sh prepare` to prepare the environment and build the code. Make sure you have enough space in your home directory & Download directory. 
+
+`hdc.sh pipe` to build the code, copy and run the code on the device, logs are saved to `~/oh-llama.cpp/logs`.
+
 ## Build
 
 Building llama.cpp with RKNN backend on OpenHarmony. 
@@ -61,7 +71,7 @@ hdc file send ~/oh-llama.cpp/build/bin/ /data/llama.cpp/
 hdc into the device, then run:
 
 ```sh
-cd /data/llama.cpp/
+cd /data/oh-llama.cpp/
 ./build/bin/llama-cli -m /data/models/llama-3.2-1B-Instruct.gguf -p "Hello world!" -n 100 -t 3 -no-cnv
 ```
 

@@ -18,9 +18,11 @@ set(TARGET_NAME ggml-rknn)
 
 ggml_add_backend_library(${TARGET_NAME}
                             ggml-rknn.cpp
-                            ../../include/ggml-cpu.h
-                            ../ggml-cpu/ggml-cpu-impl.h
-                            ../../include/ggml-rknn.h)
+                            # ../../include/ggml-backend.h
+                            # ../../include/ggml-cpu.h
+                            # ../ggml-cpu/ggml-cpu-impl.h
+                            ../../include/ggml-rknn.h
+                            )
 
 # set(RKNN_API_PATH /home/hanzhang/rknn-toolkit2/rknpu2/runtime/Linux/librknn_api)
 
@@ -35,10 +37,11 @@ endif()
 
 message(STATUS "using rknn")
 target_link_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(${TARGET_NAME} PUBLIC ggml-cpu ${CMAKE_SOURCE_DIR}/lib/librkllmrt.so ${CMAKE_SOURCE_DIR}/lib/librknnrt.so)
+target_link_libraries(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib/librknnrt.so)
 # target_link_libraries(${TARGET_NAME} PUBLIC ggml-cpu ${CMAKE_SOURCE_DIR}/lib/librkllmrt.so ${CMAKE_SOURCE_DIR}/lib/librknnrt.so nlohmann_json::nlohmann_json)
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib)
-
+target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/common)
+target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_BINARY_DIR}/bin)
 
 # find_library(RKLLMRT NAMES rkllmrt librkllmrt PATHS ${PROJECT_SOURCE_DIR}/lib)
 

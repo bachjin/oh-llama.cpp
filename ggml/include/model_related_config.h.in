@@ -1,1 +1,1 @@
-#define CONFIG_DIR "@CMAKE_SOURCE_DIR@/scripts"
+#define CONFIG_DIR "@CMAKE_DEST_DIR@/scripts"

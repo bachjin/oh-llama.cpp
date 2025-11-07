@@ -1,0 +1,6 @@
+{
+    "npu_prefill": true,
+    "npu_decode": true,
+    "offload_nodes": ["ffn.*", ".*output"],
+    "loaded_nodes": []
+}
