@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <regex>
 #include <mutex>
 
@@ -45,12 +46,15 @@
 #include <json.hpp>
 using json = nlohmann::json;
 
+// #define RKNN_MATMUL_DEBUG_TIMING_INFO
 #define GGML_COMMON_DECL_C
 // #define RKNN_MATMUL_DEBUG
 
 // #define RKNN_MATMUL_DEBUG_TIMING_INFO
 
 // #define RKNN_MATMUL_DEBUG_TIMING_DETAILS
+
+// #define RKNN_NPU_CORE_DEBUG
 
 #define GGML_RKNPU2_USE_OUTSIDE_ALLOC 0
 
@@ -61,13 +65,12 @@ using namespace rknpu2;
 
 #define GGML_RKNPU2_INPUT_SCALE 1.7f
 
-
 #define GGML_NAME_MAX 64
 
 #define MAX_RKNN_MEMORY (1024ULL * 1024 * 1024 * 4) // 4GB
 
 #define MAX_K 8192 // hardware flaw
-#define MAX_M_WARMUP 512 // 512 
+#define MAX_M_WARMUP 512
 
 //MARK: LOCAL VAR
 
@@ -75,8 +78,61 @@ uint32_t omp_threads = 4;
 
 uint64_t rknpu2_allocated_bytes = 0;
 
-// Hashset for fast loaded_nodes lookup
+// Externally-set prefill/decode phase.
+// Set to true before a prefill step, false before a decode step, via
+// ggml_backend_rknn_set_is_prefill().  Used only in ggml_rk_compute_forward
+// for runtime behaviour (logging, future per-phase logic).
+// supports_op always uses ne1>1 which is reliable during sched_reserve.
+static std::atomic<bool> g_rknn_is_prefill{false};
+static std::atomic<bool> g_rknn_prefill_explicitly_set{false};
+
+// Warmup flag. Set to true via ggml_backend_rknn_set_warmup(true) before the
+// warmup decode, and false after.  During warmup, supports_op checks BOTH
+// prefill and decode pattern lists (union) so that all kernels are initialized.
+static std::atomic<bool> g_rknn_is_warmup{false};
+
+// Hashset for fast loaded_nodes lookup (includes nodes dynamically added during warmup)
 static std::unordered_set<std::string> loaded_nodes_set;
+
+// User-configured decode whitelist (only nodes from rknn-config.json "loaded_nodes").
+// Unlike loaded_nodes_set, this is NEVER modified at runtime — it is the ground truth
+// for what should be offloaded in the decode phase.
+static std::unordered_set<std::string> user_loaded_nodes_set;
+
+// Pre-compiled regex patterns for offload_nodes (decode, compiled once at config load)
+static std::vector<std::regex> compiled_offload_patterns;
+
+// Cache for decode offload node match results (node_name -> matches_any_pattern)
+static std::unordered_map<std::string, bool> offload_match_cache;
+
+// Pre-compiled regex patterns for prefill_offload_nodes (compiled once at config load)
+static std::vector<std::regex> compiled_prefill_offload_patterns;
+
+// Cache for prefill offload node match results (node_name -> matches_any_pattern)
+static std::unordered_map<std::string, bool> prefill_offload_match_cache;
+
+// --- Post-warmup frozen offload sets ---
+// After warmup completes, the match caches are frozen into plain hash-sets.
+// supports_op uses these for O(1) lookup, completely bypassing regex/cache logic.
+static bool g_warmup_done = false;
+static bool g_prefill_release_done = false;
+static std::unordered_set<std::string> frozen_decode_offload_set;   // op names that matched decode patterns
+static std::unordered_set<std::string> frozen_prefill_offload_set;  // op names that matched prefill patterns
+
+// Per-operation NPU core mask: list of (compiled_pattern, core_mask_bits) pairs
+// core_mask_bits is a bitmask: bit0=CORE_0, bit1=CORE_1, bit2=CORE_2 (e.g. 0x6 = CORE_1+CORE_2)
+static std::vector<std::pair<std::regex, int>> compiled_op_npu_core_patterns;
+
+// Cache for per-op NPU core mask lookups (node_name -> core_mask_bits)
+static std::unordered_map<std::string, int> op_npu_core_cache;
+
+// Pre-compiled regex patterns for ac_layout_perf_nodes (decode phase: matching nodes get ac_layout_perf=true)
+static std::vector<std::regex> compiled_ac_layout_perf_patterns;
+static std::unordered_map<std::string, bool> ac_layout_perf_match_cache;
+
+// Pre-compiled regex patterns for ac_layout_perf_nodes_prefill (prefill phase).
+static std::vector<std::regex> compiled_ac_layout_perf_prefill_patterns;
+static std::unordered_map<std::string, bool> ac_layout_perf_prefill_match_cache;
 
 
 
@@ -106,6 +162,47 @@ static std::unordered_set<std::string> loaded_nodes_set;
 #else
     #define timing_debug_printf(...) (0)
 #endif
+
+// Uncomment (or pass -DRKNN_NPU_CORE_DEBUG) to enable NPU core-assignment debug prints
+// #define RKNN_NPU_CORE_DEBUG
+
+#ifdef RKNN_NPU_CORE_DEBUG
+    #define npu_core_debug_printf(...) printf(__VA_ARGS__)
+#else
+    #define npu_core_debug_printf(...) (0)
+#endif
+
+// Helper: convert rknn_core_mask bitmask to human-readable string
+static inline const char* core_mask_to_str(int mask) {
+    switch (mask) {
+        case 1: return "CORE_0";
+        case 2: return "CORE_1";
+        case 4: return "CORE_2";
+        case 3: return "CORE_0_1";
+        case 5: return "CORE_0_2";
+        case 6: return "CORE_1_2";
+        case 7: return "CORE_0_1_2";
+        default: return "CORE_AUTO";
+    }
+}
+
+// Helper: given a core_mask_bits bitmask (e.g. 0x6 = bit1+bit2 = CORE_1+CORE_2),
+// returns the single-core mask (1<<bitN) assigned to thread_idx.
+// Bits are enumerated in ascending order (CORE_0 first).
+// If thread_idx >= popcount(core_mask_bits), wraps around.
+static inline int npu_core_for_thread(int core_mask_bits, int thread_idx) {
+    int count = 0;
+    int first_bit_mask = 0;
+    for (int bit = 0; bit < 8; bit++) {
+        if (core_mask_bits & (1 << bit)) {
+            if (first_bit_mask == 0) first_bit_mask = (1 << bit);
+            if (count == thread_idx) return (1 << bit);
+            count++;
+        }
+    }
+    // Wrap around (thread_idx >= popcount) — assign to first available core
+    return first_bit_mask ? first_bit_mask : 1;
+}
 
 #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
 //MARK: DMA
@@ -215,6 +312,7 @@ void set_default_rknn_config(json *rknn_config_ptr) {
     (*rknn_config_ptr)["npu_prefill"] = true;
     (*rknn_config_ptr)["npu_decode"] = true;
     (*rknn_config_ptr)["offload_nodes"] = json::array({"ffn.*", ".*output"});
+    (*rknn_config_ptr)["prefill_offload_nodes"] = json::array({"ffn.*", ".*output"});
     (*rknn_config_ptr)["loaded_nodes"] = json::array({});
     (*rknn_config_ptr)["regex"] = true;
 }
@@ -223,10 +321,14 @@ static json local_rknn_config = {
     {"npu_prefill", false},
     {"npu_decode", false}, 
     {"offload_nodes", json::array({"ffn.*", ".*output"})},
+    {"prefill_offload_nodes", json::array({"ffn.*", ".*output"})},
     {"loaded_nodes", json::array({})},
     {"omp_threads", 4},
     {"regex", true},
-    {"num_cores", 3}
+    {"npu_core_mask", 7},  // bitmask: bit0=CORE_0 bit1=CORE_1 bit2=CORE_2, default=0x7 (all 3)
+    {"op_npu_cores", json::array({})},
+    {"ac_layout_perf_nodes", json::array({})},          // decode phase: matching nodes get ac_layout_perf=true
+    {"ac_layout_perf_nodes_prefill", json::array({})}   // prefill phase: matching nodes get ac_layout_perf=true
 };
 
 
@@ -273,6 +375,17 @@ void init_rknn_config(json *rknn_config_ptr) {
         (*rknn_config_ptr)["offload_nodes"] = file_rknn_config["offload_nodes"];
     }
 
+    const char* prefill_offload_nodes_env = getenv("PREFILL_OFFLOAD_NODES");
+    if (prefill_offload_nodes_env != nullptr) {
+        (*rknn_config_ptr)["prefill_offload_nodes"] = json::parse(prefill_offload_nodes_env);
+        has_env = true;
+    } else if (file_rknn_config.contains("prefill_offload_nodes")) {
+        (*rknn_config_ptr)["prefill_offload_nodes"] = file_rknn_config["prefill_offload_nodes"];
+    } else {
+        // Fall back to offload_nodes if prefill_offload_nodes is not configured
+        (*rknn_config_ptr)["prefill_offload_nodes"] = (*rknn_config_ptr)["offload_nodes"];
+    }
+
     const char* loaded_nodes_env = getenv("LOADED_NODES");
     if (loaded_nodes_env != nullptr) {
         (*rknn_config_ptr)["loaded_nodes"] = json::parse(loaded_nodes_env);
@@ -281,18 +394,88 @@ void init_rknn_config(json *rknn_config_ptr) {
         (*rknn_config_ptr)["loaded_nodes"] = file_rknn_config["loaded_nodes"];
     }
 
-    const char* num_cores_env = getenv("NUM_CORES");
-    if (num_cores_env != nullptr) {
-        (*rknn_config_ptr)["num_cores"] = std::stoi(num_cores_env);
+    // npu_core_mask: bitmask of which NPU cores to use (e.g. 7=all3, 3=CORE_0+CORE_1, 6=CORE_1+CORE_2)
+    // Also accept legacy num_npu_cores (integer count) for backward compatibility: converted to mask (1<<n)-1
+    const char* npu_core_mask_env = getenv("npu_core_mask");
+    const char* num_npu_cores_env = getenv("num_npu_cores");  // legacy
+    if (npu_core_mask_env != nullptr) {
+        (*rknn_config_ptr)["npu_core_mask"] = std::stoi(npu_core_mask_env);
         has_env = true;
+    } else if (num_npu_cores_env != nullptr) {
+        // Convert count N to mask (1<<N)-1: e.g. N=2 -> 0x3 (CORE_0+CORE_1)
+        int n = std::stoi(num_npu_cores_env);
+        (*rknn_config_ptr)["npu_core_mask"] = (1 << n) - 1;
+        has_env = true;
+    } else if (file_rknn_config.contains("npu_core_mask")) {
+        (*rknn_config_ptr)["npu_core_mask"] = file_rknn_config["npu_core_mask"];
+    } else if (file_rknn_config.contains("num_npu_cores")) {
+        // Legacy config field: convert to mask
+        int n = file_rknn_config["num_npu_cores"].get<int>();
+        (*rknn_config_ptr)["npu_core_mask"] = (1 << n) - 1;
     } else {
-        (*rknn_config_ptr)["num_cores"] = file_rknn_config["num_cores"];
+        (*rknn_config_ptr)["npu_core_mask"] = local_rknn_config["npu_core_mask"];
     }
 
-    // Populate loaded_nodes_set for fast lookup
+    // Parse op_npu_cores: array of {"pattern": "...", "core_mask": bitmask}
+    // core_mask is a bitmask of NPU cores (bit0=CORE_0, bit1=CORE_1, bit2=CORE_2).
+    // Also accepts legacy "num_cores" integer field (converted to (1<<N)-1 mask).
+    // Per-op override takes priority over global npu_core_mask.
+    // Env var OP_NPU_CORES (JSON array) takes priority over config file.
+    compiled_op_npu_core_patterns.clear();
+    op_npu_core_cache.clear();
+    const char* op_npu_cores_env = getenv("OP_NPU_CORES");
+    if (op_npu_cores_env != nullptr) {
+        (*rknn_config_ptr)["op_npu_cores"] = json::parse(op_npu_cores_env);
+        has_env = true;
+    } else if (file_rknn_config.contains("op_npu_cores")) {
+        (*rknn_config_ptr)["op_npu_cores"] = file_rknn_config["op_npu_cores"];
+    } else {
+        (*rknn_config_ptr)["op_npu_cores"] = json::array({});
+    }
+    for (const auto &entry : (*rknn_config_ptr)["op_npu_cores"]) {
+        int mask;
+        if (entry.contains("core_mask")) {
+            mask = entry["core_mask"].get<int>();
+        } else {
+            // Legacy "num_cores": N -> mask (1<<N)-1
+            int n = entry["num_cores"].get<int>();
+            mask = (1 << n) - 1;
+        }
+        compiled_op_npu_core_patterns.emplace_back(
+            std::regex(entry["pattern"].get<std::string>(), std::regex::optimize),
+            mask);
+    }
+
+    // Populate loaded_nodes_set and user_loaded_nodes_set from config.
+    // user_loaded_nodes_set is the immutable user-configured decode whitelist.
+    // loaded_nodes_set will also accumulate nodes dynamically loaded during warmup.
     loaded_nodes_set.clear();
+    user_loaded_nodes_set.clear();
     for (const auto &node_name : (*rknn_config_ptr)["loaded_nodes"]) {
-        loaded_nodes_set.insert(node_name.get<std::string>());
+        const std::string s = node_name.get<std::string>();
+        loaded_nodes_set.insert(s);
+        user_loaded_nodes_set.insert(s);
+    }
+
+    // Reset post-warmup frozen sets (will be rebuilt after next warmup)
+    g_warmup_done = false;
+    frozen_decode_offload_set.clear();
+    frozen_prefill_offload_set.clear();
+
+    // Pre-compile offload_nodes regex patterns for decode (done once at config load)
+    compiled_offload_patterns.clear();
+    offload_match_cache.clear();
+    for (const auto &node_name : (*rknn_config_ptr)["offload_nodes"]) {
+        compiled_offload_patterns.emplace_back(
+            node_name.get<std::string>(), std::regex::optimize);
+    }
+
+    // Pre-compile prefill_offload_nodes regex patterns (done once at config load)
+    compiled_prefill_offload_patterns.clear();
+    prefill_offload_match_cache.clear();
+    for (const auto &node_name : (*rknn_config_ptr)["prefill_offload_nodes"]) {
+        compiled_prefill_offload_patterns.emplace_back(
+            node_name.get<std::string>(), std::regex::optimize);
     }
 
     //TODO: not used
@@ -313,6 +496,40 @@ void init_rknn_config(json *rknn_config_ptr) {
         (*rknn_config_ptr)["omp_threads"] = file_rknn_config["omp_threads"];
     }
 
+    // ac_layout_perf_nodes: list of regex; nodes whose name matches any pattern get ac_layout_perf=true
+    const char* ac_layout_perf_nodes_env = getenv("AC_LAYOUT_PERF_NODES");
+    if (ac_layout_perf_nodes_env != nullptr) {
+        (*rknn_config_ptr)["ac_layout_perf_nodes"] = json::parse(ac_layout_perf_nodes_env);
+        has_env = true;
+    } else if (file_rknn_config.contains("ac_layout_perf_nodes")) {
+        (*rknn_config_ptr)["ac_layout_perf_nodes"] = file_rknn_config["ac_layout_perf_nodes"];
+    } else {
+        (*rknn_config_ptr)["ac_layout_perf_nodes"] = local_rknn_config["ac_layout_perf_nodes"];
+    }
+    compiled_ac_layout_perf_patterns.clear();
+    ac_layout_perf_match_cache.clear();
+    for (const auto &node_name : (*rknn_config_ptr)["ac_layout_perf_nodes"]) {
+        compiled_ac_layout_perf_patterns.emplace_back(
+            node_name.get<std::string>(), std::regex::optimize);
+    }
+
+    // ac_layout_perf_nodes_prefill: same structure, but for the prefill phase
+    const char* ac_layout_perf_nodes_prefill_env = getenv("AC_LAYOUT_PERF_NODES_PREFILL");
+    if (ac_layout_perf_nodes_prefill_env != nullptr) {
+        (*rknn_config_ptr)["ac_layout_perf_nodes_prefill"] = json::parse(ac_layout_perf_nodes_prefill_env);
+        has_env = true;
+    } else if (file_rknn_config.contains("ac_layout_perf_nodes_prefill")) {
+        (*rknn_config_ptr)["ac_layout_perf_nodes_prefill"] = file_rknn_config["ac_layout_perf_nodes_prefill"];
+    } else {
+        (*rknn_config_ptr)["ac_layout_perf_nodes_prefill"] = local_rknn_config["ac_layout_perf_nodes_prefill"];
+    }
+    compiled_ac_layout_perf_prefill_patterns.clear();
+    ac_layout_perf_prefill_match_cache.clear();
+    for (const auto &node_name : (*rknn_config_ptr)["ac_layout_perf_nodes_prefill"]) {
+        compiled_ac_layout_perf_prefill_patterns.emplace_back(
+            node_name.get<std::string>(), std::regex::optimize);
+    }
+
     if (has_env) {
         // set_default_rknn_config(rknn_config_ptr); 
         printf("ggml-rknn: using environment variables\n");
@@ -320,7 +537,8 @@ void init_rknn_config(json *rknn_config_ptr) {
     
     printf("ggml-rknn: npu_prefill: %d\n", (*rknn_config_ptr)["npu_prefill"].get<bool>());
     printf("ggml-rknn: npu_decode: %d\n", (*rknn_config_ptr)["npu_decode"].get<bool>());
-    printf("ggml-rknn: offload_nodes: %s\n", (*rknn_config_ptr)["offload_nodes"].dump().c_str());
+    printf("ggml-rknn: offload_nodes (decode): %s\n", (*rknn_config_ptr)["offload_nodes"].dump().c_str());
+    printf("ggml-rknn: prefill_offload_nodes: %s\n", (*rknn_config_ptr)["prefill_offload_nodes"].dump().c_str());
 
     std::string loaded_nodes_str = "{";
     for (auto it = loaded_nodes_set.begin(); it != loaded_nodes_set.end(); ++it) {
@@ -330,8 +548,79 @@ void init_rknn_config(json *rknn_config_ptr) {
     loaded_nodes_str += "}";
     printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
 
+    printf("ggml-rknn: ac_layout_perf_nodes (decode): %s\n", (*rknn_config_ptr)["ac_layout_perf_nodes"].dump().c_str());
+    printf("ggml-rknn: ac_layout_perf_nodes_prefill: %s\n", (*rknn_config_ptr)["ac_layout_perf_nodes_prefill"].dump().c_str());
     printf("ggml-rknn: complete config dump: %s\n", (*rknn_config_ptr).dump().c_str());
+    printf("ggml-rknn: op_npu_cores: %s\n", (*rknn_config_ptr)["op_npu_cores"].dump().c_str());
 
+}
+
+// Returns the NPU core bitmask for the given operation name.
+// Matches compiled_op_npu_core_patterns in order; returns default_mask if none match.
+// Results are cached in op_npu_core_cache for fast repeated lookup.
+// Bitmask: bit0=CORE_0, bit1=CORE_1, bit2=CORE_2 (e.g. 0x6 = CORE_1+CORE_2).
+static int get_op_npu_core_mask(const char *name, int default_mask) {
+    std::string key(name);
+    auto it = op_npu_core_cache.find(key);
+    if (it != op_npu_core_cache.end()) {
+        npu_core_debug_printf("[NPU_CORE] get_op_npu_core_mask: \"%s\" -> 0x%x %s (cached)\n", name, it->second, core_mask_to_str(it->second));
+        return it->second;
+    }
+    for (size_t i = 0; i < compiled_op_npu_core_patterns.size(); ++i) {
+        const auto &pat_mask = compiled_op_npu_core_patterns[i];
+        if (std::regex_search(key, pat_mask.first)) {
+            op_npu_core_cache[key] = pat_mask.second;
+            npu_core_debug_printf("[NPU_CORE] get_op_npu_core_mask: \"%s\" matched pattern #%zu -> core_mask=0x%x (%s)\n", name, i, pat_mask.second, core_mask_to_str(pat_mask.second));
+            return pat_mask.second;
+        }
+    }
+    op_npu_core_cache[key] = default_mask;
+    npu_core_debug_printf("[NPU_CORE] get_op_npu_core_mask: \"%s\" no pattern matched -> default=0x%x (%s)\n", name, default_mask, core_mask_to_str(default_mask));
+    return default_mask;
+}
+
+// Returns true if node name matches any ac_layout_perf_nodes regex (decode phase perf layout).
+// Results are cached in ac_layout_perf_match_cache.
+static bool match_ac_layout_perf_node(const char *node_name) {
+    if (compiled_ac_layout_perf_patterns.empty()) {
+        return false;
+    }
+    std::string key(node_name);
+    auto it = ac_layout_perf_match_cache.find(key);
+    if (it != ac_layout_perf_match_cache.end()) {
+        return it->second;
+    }
+    bool matched = false;
+    for (const auto &pattern : compiled_ac_layout_perf_patterns) {
+        if (std::regex_match(key, pattern)) {
+            matched = true;
+            break;
+        }
+    }
+    ac_layout_perf_match_cache[key] = matched;
+    return matched;
+}
+
+// Returns true if node name matches any ac_layout_perf_nodes_prefill regex (prefill phase perf layout).
+// Results are cached in ac_layout_perf_prefill_match_cache.
+static bool match_ac_layout_perf_prefill_node(const char *node_name) {
+    if (compiled_ac_layout_perf_prefill_patterns.empty()) {
+        return false;
+    }
+    std::string key(node_name);
+    auto it = ac_layout_perf_prefill_match_cache.find(key);
+    if (it != ac_layout_perf_prefill_match_cache.end()) {
+        return it->second;
+    }
+    bool matched = false;
+    for (const auto &pattern : compiled_ac_layout_perf_prefill_patterns) {
+        if (std::regex_match(key, pattern)) {
+            matched = true;
+            break;
+        }
+    }
+    ac_layout_perf_prefill_match_cache[key] = matched;
+    return matched;
 }
 
 
@@ -446,6 +735,9 @@ struct ggml_rknpu_matmul_part_AC {
     // considering prefill, AC's io_attr has higher priority than B's
     rknn_matmul_io_attr io_attr;
 
+    // default is false, which means normal layout (row-major)
+    bool ac_layout_perf = false;
+
     rknn_matmul_ctx ctx = 0;
     bool prefill = false;
     int thread_idx=0;
@@ -545,16 +837,26 @@ class rknn_timing_helper {
     void dump_time_usage() const {
         printf("\n");
         printf(" --- dump time usage avg for %d threads -----\n", this->rknn_threads);
-        printf(" %04.1f%% prepare data time A B C: %.f, %.f, %.f us\n", (this->prepare_data_time_A / this->rknn_threads + this->prepare_data_time_B + this->prepare_data_time_C / this->rknn_threads) / this->total_run_time * 100, this->prepare_data_time_A / this->rknn_threads, this->prepare_data_time_B, this->prepare_data_time_C / this->rknn_threads);
-        printf(" %04.1f%% quant time: %.f us\n", (this->quant_time / this->rknn_threads) / this->total_run_time * 100, this->quant_time / this->rknn_threads);
-        printf(" %04.1f%% memcpy to kernel time: %.f us\n", (this->memcpy_to_kernel_time / this->rknn_threads) / this->total_run_time * 100, this->memcpy_to_kernel_time / this->rknn_threads);
-        printf(" %04.1f%% find kernel time: %.f us\n", (this->find_kernel_time / this->rknn_threads) / this->total_run_time * 100, this->find_kernel_time / this->rknn_threads);
-        printf(" %04.1f%% set io time: %.f us\n", (this->set_io_time / this->rknn_threads) / this->total_run_time * 100, this->set_io_time / this->rknn_threads);
-        printf(" %04.1f%% set io time A B C: %.f, %.f, %.f us\n", (this->set_io_time / this->rknn_threads) / this->total_run_time * 100, this->set_io_time_A / this->rknn_threads, this->set_io_time_B / this->rknn_threads, this->set_io_time_C / this->rknn_threads);
-        printf(" %04.1f%% memcpy to result time: %.f us\n", (this->memcpy_to_result_time / this->rknn_threads) / this->total_run_time * 100, this->memcpy_to_result_time / this->rknn_threads);
-        printf(" %04.1f%% run time: %.f us\n", (this->run_time / this->rknn_threads) / this->total_run_time * 100, this->run_time / this->rknn_threads);
-        printf(" %04.1f%% free pointer time: %.f us\n", (this->free_pointer_time / this->rknn_threads) / this->total_run_time * 100, this->free_pointer_time / this->rknn_threads);
-        printf(" 100.0%% total_run_time: %.f us\n", this->total_run_time);
+        printf(" %8.0f us (%04.1f%%) prepare data time A B C: %.f, %.f, %.f us\n", \
+            (this->prepare_data_time_A / this->rknn_threads + this->prepare_data_time_B + this->prepare_data_time_C / this->rknn_threads), \
+            (this->prepare_data_time_A / this->rknn_threads + this->prepare_data_time_B + this->prepare_data_time_C / this->rknn_threads) / this->total_run_time * 100, \
+            this->prepare_data_time_A / this->rknn_threads, \
+            this->prepare_data_time_B, \
+            this->prepare_data_time_C / this->rknn_threads);
+        printf(" %8.0f us (%04.1f%%) quant time\n", (this->quant_time / this->rknn_threads), (this->quant_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) memcpy to kernel time\n", (this->memcpy_to_kernel_time / this->rknn_threads), (this->memcpy_to_kernel_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) find kernel time\n", (this->find_kernel_time / this->rknn_threads), (this->find_kernel_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) set io time\n", (this->set_io_time / this->rknn_threads), (this->set_io_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) set io time A B C: %.f, %.f, %.f us\n", \
+            (this->set_io_time / this->rknn_threads), \
+            (this->set_io_time / this->rknn_threads) / this->total_run_time * 100, \
+            this->set_io_time_A / this->rknn_threads, \
+            this->set_io_time_B / this->rknn_threads, \
+            this->set_io_time_C / this->rknn_threads);
+        printf(" %8.0f us (%04.1f%%) memcpy to result time\n", (this->memcpy_to_result_time / this->rknn_threads), (this->memcpy_to_result_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) run time\n", (this->run_time / this->rknn_threads), (this->run_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (%04.1f%%) free pointer time\n", (this->free_pointer_time / this->rknn_threads), (this->free_pointer_time / this->rknn_threads) / this->total_run_time * 100);
+        printf(" %8.0f us (100.0%%) total_run_time\n", this->total_run_time);
     }
 };
 
@@ -658,11 +960,11 @@ static void dump_matmul_tensor_attr(rknn_matmul_tensor_attr *attr)
          get_type_string(attr->type));
 }
 
-struct ggml_rknpu_matmul_part_AC * ggml_rknpu_matmul_part_AC_find(int m, int k, int n, rknn_matmul_type type, int thread_idx){
+struct ggml_rknpu_matmul_part_AC * ggml_rknpu_matmul_part_AC_find(int m, int k, int n, rknn_matmul_type type, int thread_idx, bool is_prefill=false){
     timing_debug_printf("ggml-rknn: ggml_rknpu_matmul_part_AC_find: m: %d, k: %d, n: %d, type: %s, thread_idx: %d\n", m, k, n, rknpu2_matmul_type_to_string(type), thread_idx);
     for (int i = 0; i < matmul_parts_AC_count; i++) {
         ggml_rknpu_matmul_part_AC *part = &matmul_parts_AC[i];
-        if (part->M == m && part->K == k && part->N == n && part->type == type && part->thread_idx == thread_idx && part->is_using == false) {
+        if (part->M == m && part->K == k && part->N == n && part->type == type && part->thread_idx == thread_idx && part->is_using == false && part->prefill == is_prefill) {
             return part;
         }
     }
@@ -688,19 +990,30 @@ struct ggml_rknpu_matmul_part_B * ggml_rknpu_matmul_part_B_find(const char * nam
     return NULL;
 }
 
-struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmul_type type, int thread_idx, char * name, int num_cores = local_rknn_config["num_cores"].get<int>()) {
+struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmul_type type, int thread_idx, char * name, int core_mask_bits, int ac_layout_perf=1) {
+    // core_mask_bits: bitmask of allowed NPU cores (bit0=CORE_0, bit1=CORE_1, bit2=CORE_2)
+    // ac_layout_perf bitmask: bit0=decode_perf, bit1=prefill_perf
+    //   0=off for both, 1=decode on only, 2=prefill on only, 3=both on
+    const bool decode_perf  = (ac_layout_perf & 1) != 0;
+    const bool prefill_perf = (ac_layout_perf & 2) != 0;
+    const bool is_prefill_current = (M > DECODE_MAX_M);
+
     if (name == NULL) {
         timing_debug_printf("ggml-rknn: create_matmul_pair: name is NULL\n");
         name = strdup("unknown");
     }
 
-    timing_debug_printf("ggml-rknn: create_matmul_pair: name: %s, thread_idx: %d, num_cores: %d\n", name, thread_idx, num_cores);
+    timing_debug_printf("ggml-rknn: create_matmul_pair: name: %s, thread_idx: %d, core_mask_bits: 0x%x decode_perf=%d prefill_perf=%d is_prefill=%d\n",
+                        name, thread_idx, core_mask_bits, decode_perf, prefill_perf, is_prefill_current);
 
-    ggml_rknpu_matmul_part_AC *part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx);
+    ggml_rknpu_matmul_part_AC *part_AC = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx, is_prefill_current);
     ggml_rknpu_matmul_part_B *part_B = ggml_rknpu_matmul_part_B_find(name, thread_idx);
 
-    // assign to core_id = thread_idx % 3 (3 cores on RK3588)
-    rknn_core_mask core_mask = (rknn_core_mask)(1 << (thread_idx % num_cores));
+    // Assign thread to the thread_idx-th set bit in core_mask_bits.
+    // e.g. core_mask_bits=0x6 (CORE_1+CORE_2): thread 0->CORE_1, thread 1->CORE_2
+    rknn_core_mask core_mask = (rknn_core_mask)npu_core_for_thread(core_mask_bits, thread_idx);
+    npu_core_debug_printf("[NPU_CORE] create_matmul_pair: name=%s thread_idx=%d core_mask_bits=0x%x -> core_mask=0x%x (%s)\n",
+                          name, thread_idx, core_mask_bits, (int)core_mask, core_mask_to_str((int)core_mask));
 
     timing_debug_printf("ggml-rknn: creating matmul pair for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
 
@@ -732,7 +1045,7 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
         part_B ->info.N = N;
         part_B ->info.type = type;
         part_B ->info.B_layout = 1; // B use native layout (weight)
-        part_B ->info.AC_layout = 1; // A and C use performance layout (intermediate)
+        part_B ->info.AC_layout = decode_perf ? 1 : 0; // A and C layout for decode phase
 
         memset(&part_B->io_attr, 0, sizeof(rknn_matmul_io_attr));
 
@@ -740,6 +1053,8 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
         GGML_ASSERT(ret == 0);
 
         rknn_matmul_set_core_mask(part_B->ctx, core_mask);
+        npu_core_debug_printf("[NPU_CORE] rknn_matmul_set_core_mask (new B): name=%s thread=%d mask=0x%x (%s)\n",
+                              name, thread_idx, (int)core_mask, core_mask_to_str((int)core_mask));
 
         #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
             int fd = -1;
@@ -768,99 +1083,118 @@ struct ggml_rknpu_matmul_pair create_matmul_pair(int M, int K, int N, rknn_matmu
 
         timing_debug_printf("ggml-rknn: created B node %s:%d; bytes: %ud\n", name, thread_idx, part_B->io_attr.B.size);
     } else {
+        rknn_matmul_set_core_mask(part_B->ctx, core_mask);
+        npu_core_debug_printf("[NPU_CORE] rknn_matmul_set_core_mask (existing B): name=%s thread=%d mask=0x%x (%s)\n",
+                              name, thread_idx, (int)core_mask, core_mask_to_str((int)core_mask));
+
         timing_debug_printf("ggml-rknn: found B node %s:%d size %d x %d x %d\n", part_B->name, part_B->thread_idx, part_B->info.M, part_B->info.K, part_B->info.N);
     }
     GGML_ASSERT(part_B != NULL);
 
     if (part_AC == NULL) {
         timing_debug_printf("ggml-rknn: no AC found, creating new AC for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-        if (matmul_parts_AC_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
-            fprintf(stderr, "ggml-rknn: matmul_parts_AC_count too much part_AC \n");
-            GGML_ASSERT(0);
-        }
-        // Add a mutex at file/class level
-        static std::mutex matmul_parts_AC_mutex;
 
-        // Then protect the increment:
+        static std::mutex matmul_parts_AC_mutex;
+        static std::mutex rknpu2_allocated_bytes_mutex;
         std::lock_guard<std::mutex> lock(matmul_parts_AC_mutex);
 
-        part_AC = &matmul_parts_AC[matmul_parts_AC_count++];
-        memset(part_AC, 0, sizeof(ggml_rknpu_matmul_part_AC));
-
-        part_AC->M = M;
-        part_AC->K = K;
-        part_AC->N = N;
-        part_AC->type = type;
-        part_AC->thread_idx = thread_idx;
-        
-        part_AC->prefill = (M != part_B->info.M);
-        if (part_AC->prefill) {
-            // no AC found and prefill
-            timing_debug_printf("ggml-rknn: creating prefill kernel for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-
-            rknn_matmul_info info;
-            memset(&info, 0, sizeof(rknn_matmul_info));
-            info.M = M;
-            info.K = K;
-            info.N = N;
-            info.type = type;
-            info.B_layout = 1;
-            info.AC_layout = 1;
-            
-            rknn_matmul_io_attr io_attr;
-            memset(&io_attr, 0, sizeof(rknn_matmul_io_attr));
-
-            int ret = rknn_matmul_create(&(part_AC->ctx), &info, &io_attr);
-            if (ret < 0) {
-                fprintf(stderr, "ggml-rknn: rknn_matmul_create failed for A node %s:%d size %d x %d\n", name, thread_idx, M, K);
+        // Helper: allocate and initialize one part_AC entry.
+        // is_prefill_variant=true  → own rknn_matmul ctx with use_perf AC_layout (prefill path).
+        // is_prefill_variant=false → shared part_B ctx whose AC_layout was baked in at part_B creation
+        //                            (decode_perf); only valid when M == part_B->info.M.
+        auto create_one_ac = [&](bool is_prefill_variant, bool use_perf) -> ggml_rknpu_matmul_part_AC* {
+            if (matmul_parts_AC_count >= GGML_RKNPU2_MAX_MATMUL_PARTS) {
+                fprintf(stderr, "ggml-rknn: matmul_parts_AC_count too much part_AC \n");
                 GGML_ASSERT(0);
             }
+            ggml_rknpu_matmul_part_AC *ac = &matmul_parts_AC[matmul_parts_AC_count++];
+            memset(ac, 0, sizeof(ggml_rknpu_matmul_part_AC));
+            ac->M = M;
+            ac->K = K;
+            ac->N = N;
+            ac->type = type;
+            ac->thread_idx = thread_idx;
+            ac->ac_layout_perf = use_perf;
+            ac->prefill = is_prefill_variant;
 
-            rknn_set_core_mask(part_AC->ctx, core_mask);
+            if (is_prefill_variant) {
+                timing_debug_printf("ggml-rknn: creating prefill-variant AC for %s:%d size %d x %d x %d ac_perf=%d\n",
+                                    name, thread_idx, M, K, N, use_perf);
+                rknn_matmul_info info;
+                memset(&info, 0, sizeof(rknn_matmul_info));
+                info.M = M; info.K = K; info.N = N; info.type = type;
+                info.B_layout = 1;
+                info.AC_layout = use_perf ? 1 : 0;
+                rknn_matmul_io_attr io_attr;
+                memset(&io_attr, 0, sizeof(rknn_matmul_io_attr));
+                int ret = rknn_matmul_create(&ac->ctx, &info, &io_attr);
+                if (ret < 0) {
+                    fprintf(stderr, "ggml-rknn: rknn_matmul_create failed for prefill-variant AC %s:%d %d x %d\n",
+                            name, thread_idx, M, K);
+                    GGML_ASSERT(0);
+                }
+                rknn_set_core_mask(ac->ctx, core_mask);
+                npu_core_debug_printf("[NPU_CORE] rknn_set_core_mask (new AC prefill-variant): name=%s thread=%d mask=0x%x (%s)\n",
+                                      name, thread_idx, (int)core_mask, core_mask_to_str((int)core_mask));
+                ac->io_attr = io_attr;
+            } else {
+                timing_debug_printf("ggml-rknn: creating decode-variant AC for %s:%d size %d x %d x %d ac_perf=%d\n",
+                                    name, thread_idx, M, K, N, use_perf);
+                ac->ctx = part_B->ctx;
+                ac->io_attr = part_B->io_attr;
+            }
 
-            // assume we have warmup before prefill
+            ac->A = rknn_create_mem(ac->ctx, ac->io_attr.A.size);
+            {
+                std::lock_guard<std::mutex> alloc_lock(rknpu2_allocated_bytes_mutex);
+                rknpu2_allocated_bytes += ac->io_attr.A.size;
+            }
+            if (ac->A == NULL) {
+                fprintf(stderr, "ggml-rknn: rknn_create_mem failed for A %s:%d bytes: %u %d x %d\n",
+                        name, thread_idx, ac->io_attr.A.size, M, K);
+                GGML_ASSERT(0);
+            }
+            ac->C = rknn_create_mem(ac->ctx, ac->io_attr.C.size);
+            {
+                std::lock_guard<std::mutex> alloc_lock(rknpu2_allocated_bytes_mutex);
+                rknpu2_allocated_bytes += ac->io_attr.C.size;
+            }
+            if (ac->C == NULL) {
+                fprintf(stderr, "ggml-rknn: rknn_create_mem failed for C %s:%d bytes: %u %d x %d\n",
+                        name, thread_idx, ac->io_attr.C.size, M, N);
+                GGML_ASSERT(0);
+            }
+            timing_debug_printf("ggml-rknn: created AC (prefill=%d ac_perf=%d) for %s:%d bytes: %ud\n",
+                                 is_prefill_variant, use_perf, name, thread_idx,
+                                 ac->io_attr.A.size + ac->io_attr.C.size);
+            return ac;
+        };
 
-            part_AC->io_attr = io_attr;
-        } else {
-            // no AC found and decode
-            timing_debug_printf("ggml-rknn: no AC found and decode case for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
-            part_AC->ctx = part_B->ctx;
+        // Create the primary part_AC for the current call's phase.
+        bool current_perf = is_prefill_current ? prefill_perf : decode_perf;
+        part_AC = create_one_ac(is_prefill_current, current_perf);
 
-            // timing_debug_printf("input/output matmul current tensor attribute:\n");
-            // dump_matmul_tensor_attr(&part_B->io_attr[idx].A);
-            // dump_matmul_tensor_attr(&part_B->io_attr[idx].B);
-            // dump_matmul_tensor_attr(&part_B->io_attr[idx].C);
-
-            part_AC->io_attr = part_B->io_attr;
+        // If decode and prefill have different settings, pre-create the alternate variant
+        // so it is ready when the other phase first runs.
+        // Decode-variant alternate is only valid when M == part_B->info.M (shared ctx).
+        if (decode_perf != prefill_perf) {
+            bool alt_is_prefill = !is_prefill_current;
+            bool alt_perf       = alt_is_prefill ? prefill_perf : decode_perf;
+            bool can_create_alt = alt_is_prefill || (M == part_B->info.M);
+            if (can_create_alt) {
+                ggml_rknpu_matmul_part_AC *alt = ggml_rknpu_matmul_part_AC_find(M, K, N, type, thread_idx, alt_is_prefill);
+                if (alt == NULL) {
+                    timing_debug_printf("ggml-rknn: pre-creating alternate AC (prefill=%d ac_perf=%d) for %s:%d\n",
+                                        alt_is_prefill, alt_perf, name, thread_idx);
+                    create_one_ac(alt_is_prefill, alt_perf);
+                }
+            }
         }
-
-        part_AC->A = rknn_create_mem(part_AC->ctx, part_AC->io_attr.A.size);
-        
-        static std::mutex rknpu2_allocated_bytes_mutex;
-        {
-            std::lock_guard<std::mutex> alloc_lock_a(rknpu2_allocated_bytes_mutex);
-            rknpu2_allocated_bytes += part_AC->io_attr.A.size;
-        }
-
-        if (part_AC->A == NULL) {
-            fprintf(stderr, "ggml-rknn: rknn_create_mem failed for A node %s:%d bytes: %u size %d x %d\n", name, thread_idx, part_AC->io_attr.A.size, M, K);
-            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
-            GGML_ASSERT(0);
-        }
-        part_AC->C = rknn_create_mem(part_AC->ctx, part_AC->io_attr.C.size);
-        
-        {
-            std::lock_guard<std::mutex> alloc_lock_c(rknpu2_allocated_bytes_mutex);
-            rknpu2_allocated_bytes += part_AC->io_attr.C.size;
-        }
-
-        if (part_AC->C == NULL) {
-            fprintf(stderr, "ggml-rknn: rknn_create_mem failed for C node %s:%d bytes: %u size %d x %d\n", name, thread_idx, part_AC->io_attr.C.size, M, N);
-            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
-            GGML_ASSERT(0);
-        }
-        timing_debug_printf("ggml-rknn: created A and C nodes for %s:%d; bytes: %ud\n", name, thread_idx, part_AC->io_attr.A.size + part_AC->io_attr.C.size);
     } else {
+        rknn_set_core_mask(part_AC->ctx, core_mask);
+        npu_core_debug_printf("[NPU_CORE] rknn_set_core_mask (existing AC): name=%s thread=%d mask=0x%x (%s)\n",
+                              name, thread_idx, (int)core_mask, core_mask_to_str((int)core_mask));
+
         // found AC
         timing_debug_printf("ggml-rknn: found AC for %s:%d size %d x %d x %d\n", name, thread_idx, M, K, N);
         if (part_AC->prefill) {
@@ -1054,7 +1388,8 @@ static void dump_matmul_tensor(rknn_tensor_mem * tensor, rknn_matmul_tensor_attr
 /**
     * @brief convert norm layout to perf layout
     * column major -> row major
-    * norm layout (GGML): [M,K] (calling [m * K + k])
+    * norm layout (GGML): [K,M] (calling [k + m * K])
+    * norm layout (RKNN): [M,K] (calling [m * K + k])
     * perf layout (RKNN): [K/subK, M, subK] (calling [(ksk * M + m) * subK + j])
     * for RK3588 we align to 16, FP16 subK=8, INT8 subK=16 
 
@@ -1100,22 +1435,38 @@ void ggml_layout_to_perf_layout_A(const float * src, rknpu2::float16 * dst, int3
     
     int outer_size = (K + subK - 1) / subK;
     
-    // Parallelize the outer loop over i (K dimension blocks)
+    // Parallelize the outer loop over k1 (K dimension blocks)
     #pragma omp parallel for num_threads(omp_threads) schedule(static)
     for (int k1 = 0; k1 < outer_size; k1++) {
-        // Pre-calculate base offset for this block to reduce index calculations
         int base_offset = k1 * M * subK;
+        int k_base = k1 * subK;
         
         for (int m = 0; m < M; m++) {
-            // Pre-calculate row offset for this row
-            int row_offset = base_offset + m * subK;
-            int src_row_offset = m * K;
+            // Source: contiguous subK floats starting at src[m*K + k_base]
+            const float * src_ptr = src + (size_t)m * K + k_base;
+            // Dest: contiguous subK float16s at dst[base_offset + m*subK]
+            int dst_offset = base_offset + m * subK;
+            uint16_t * dst_u16 = (uint16_t *)(dst + dst_offset);
             
-            // Vectorize the inner loop over j (subK elements)
-            for (int j = 0; j < subK; j++) {
-                int ki = k1 * subK + j;
-                dst[row_offset + j] = (rknpu2::float16)(src[src_row_offset + ki]);
-
+            int j = 0;
+#ifdef __ARM_NEON
+            // Convert 8 floats at a time using NEON F32->F16 hardware conversion
+            for (; j + 7 < subK; j += 8) {
+                float32x4_t f32_lo = vld1q_f32(src_ptr + j);
+                float32x4_t f32_hi = vld1q_f32(src_ptr + j + 4);
+                float16x8_t f16_vec = vcombine_f16(vcvt_f16_f32(f32_lo), vcvt_f16_f32(f32_hi));
+                vst1q_u16(dst_u16 + j, vreinterpretq_u16_f16(f16_vec));
+            }
+            // Convert remaining 4 floats
+            for (; j + 3 < subK; j += 4) {
+                float32x4_t f32_vec = vld1q_f32(src_ptr + j);
+                float16x4_t f16_vec = vcvt_f16_f32(f32_vec);
+                vst1_u16(dst_u16 + j, vreinterpret_u16_f16(f16_vec));
+            }
+#endif
+            // Scalar remainder
+            for (; j < subK; j++) {
+                dst[dst_offset + j] = (rknpu2::float16)(src_ptr[j]);
             }
         }
     }
@@ -1944,6 +2295,9 @@ static void ggml_rknn2_free(ggml_backend_t backend) {
 
     for(int i = 0 ; i < matmul_parts_AC_count; i++){
         ggml_rknpu_matmul_part_AC *part_AC = &matmul_parts_AC[i];
+        if (part_AC->is_using == true) {
+            continue;
+        }
         rknn_destroy_mem(part_AC->ctx, part_AC->A);
         rknn_destroy_mem(part_AC->ctx, part_AC->C);
         //TODO: prefill ctx not destroyed
@@ -1984,14 +2338,54 @@ void ggml_backend_rknn_set_n_threads(ggml_backend_t backend_rknn, int n_threads)
     // if (n_threads > 3) { ctx->n_threads = 3;} 
     
     // TODO: hardcode 6 threads
-    ctx->rknn_threads = 6;
+    ctx->rknn_threads = 3;
     ctx->ggml_threads = n_threads;
 
     // ctx->rknn_config = &local_rknn_config;
     // ctx->timer = rknn_timing_helper();
     ctx->timer = &local_timer;
-    local_timer.rknn_threads = n_threads;
+    local_timer.rknn_threads = ctx->rknn_threads;
     // printf("n_threads: %d\n", n_threads);
+}
+
+void ggml_backend_rknn_set_is_prefill(bool is_prefill) {
+    g_rknn_is_prefill.store(is_prefill, std::memory_order_release);
+    g_rknn_prefill_explicitly_set.store(true, std::memory_order_release);
+    // Don't log during warmup — it's misleading since warmup offloads both.
+#ifdef GGML_RKNN_DEBUG
+    if (!g_rknn_is_warmup.load(std::memory_order_relaxed)) {
+        printf("ggml-rknn: phase set to %s\n", is_prefill ? "PREFILL" : "DECODE");
+    }
+#endif
+}
+
+void ggml_backend_rknn_set_warmup(bool warmup) {
+    g_rknn_is_warmup.store(warmup, std::memory_order_release);
+
+    if (!warmup && !g_warmup_done) {
+        // Warmup just ended — freeze the match caches into fast hash-sets.
+        // After this point supports_op will use O(1) set lookups instead of
+        // regex matching or unordered_map cache probes.
+        frozen_decode_offload_set.clear();
+        frozen_prefill_offload_set.clear();
+
+        for (const auto &kv : offload_match_cache) {
+            if (kv.second) {
+                frozen_decode_offload_set.insert(kv.first);
+            }
+        }
+        for (const auto &kv : prefill_offload_match_cache) {
+            if (kv.second) {
+                frozen_prefill_offload_set.insert(kv.first);
+            }
+        }
+
+        g_warmup_done = true;
+        printf("ggml-rknn: warmup END — frozen decode offload set: %zu nodes, prefill offload set: %zu nodes\n",
+               frozen_decode_offload_set.size(), frozen_prefill_offload_set.size());
+    } else {
+        printf("ggml-rknn: warmup %s\n", warmup ? "START" : "END");
+    }
 }
 
 static ggml_backend_i ggml_backend_rknn_i = {
@@ -2056,7 +2450,10 @@ static void ggml_backend_rknn_device_get_memory(ggml_backend_dev_t dev, size_t *
     GGML_UNUSED(dev);
 }
 static enum ggml_backend_dev_type ggml_backend_rknn_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    // ACCEL (not GPU) so that CPU weight repacking (aarch64 NEON) stays enabled.
+    // GPU type causes make_cpu_buft_list to skip extra buffer types, which
+    // disables optimized weight layouts and slows CPU matmul by ~2-3x.
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 
     GGML_UNUSED(dev);
 }
@@ -2094,22 +2491,12 @@ static ggml_backend_buffer_t ggml_backend_rknn_device_buffer_from_host_ptr(ggml_
 static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
 
     switch (op->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-
         case GGML_OP_MUL_MAT:
         {
-            //TODO: bad dataflow definition
-            json rknn_config;
-            if (dev->context) {
-                rknn_config = *((ggml_backend_rknn_context *)dev->context)->rknn_config_ptr;
-            } else {
-                rknn_config = local_rknn_config;
-            }
+            // Use a reference to avoid deep-copying the JSON on every supports_op call.
+            const json& rknn_config = dev->context
+                ? *((ggml_backend_rknn_context *)dev->context)->rknn_config_ptr
+                : local_rknn_config;
 
             if (op->ne[0] == 0 || op->ne[1] == 0){
                 return false;
@@ -2134,6 +2521,31 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             const int64_t ne0 = dst->ne[0]; // n
             const int64_t ne1 = dst->ne[1]; // m
 
+            // Determine prefill/decode phase for kernel/weight initialization.
+            //
+            // During warmup sched_reserve: ne1>1 reliably distinguishes
+            // PP graph (prefill) from TG graph (decode).
+            //
+            // During actual inference (graph_compute → sched_alloc_graph):
+            // the caller has set g_rknn_is_prefill via set_is_prefill(),
+            // which is authoritative.  We must use it because some ops
+            // like result_output have ne1=1 even during prefill.
+            //
+            // Fallback: if set_is_prefill was never called (shouldn't
+            // happen after warmup), use ne1>1 heuristic.
+            bool is_warmup = g_rknn_is_warmup.load(std::memory_order_relaxed);
+            bool is_prefill;
+            if (is_warmup) {
+                // During warmup reserve, ne1 is reliable (PP graph vs TG graph)
+                is_prefill = (ne1 > 1);
+            } else if (g_rknn_prefill_explicitly_set.load(std::memory_order_relaxed)) {
+                // After warmup, use the authoritative flag from graph_compute
+                is_prefill = g_rknn_is_prefill.load(std::memory_order_relaxed);
+            } else {
+                // Fallback (should not happen in normal flow)
+                is_prefill = (ne1 > DECODE_MAX_M);
+            }
+
             //TODO: when input text is long, GGML sends zero tensors
             bool result = false;
 
@@ -2146,22 +2558,117 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
             // if (strstr(op->name, "ffn_") || strcmp(op->name, "result_output") == 0) {
             bool to_offload = false;
             bool have_loaded = false;
-            // Use hashset for O(1) lookup instead of O(n) linear search
-            if (loaded_nodes_set.find(std::string(op->name)) != loaded_nodes_set.end()) {
-                have_loaded = true;
-                timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                // timing_debug_printf(rknn_config["loaded_nodes"].dump().c_str());
-            } 
-            if (!have_loaded && rknn_config["offload_nodes"].size() > 0) {
-                for (const auto &node_name : rknn_config["offload_nodes"]) {
-                    std::regex pattern(node_name.get<std::string>());
-                    if (std::regex_match(op->name, pattern)) {
-                        to_offload = true;
-                        timing_debug_printf("ggml-rknn: offload node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                        break;
+
+            // ---- Fast path: post-warmup, use frozen hash-set lookup ----
+            // After warmup is done the set of offloadable op names is fixed.
+            // A single unordered_set::count() replaces all regex / cache work.
+            if (g_warmup_done && !is_warmup) {
+                const std::string name_str(op->name);
+
+                if (!is_prefill) {
+                    have_loaded = user_loaded_nodes_set.count(name_str) > 0;
+                }
+
+                const auto &frozen_set = is_prefill ? frozen_prefill_offload_set : frozen_decode_offload_set;
+                to_offload = frozen_set.count(name_str) > 0;
+
+                timing_debug_printf("ggml-rknn: [fast] %s %s: to_offload=%d have_loaded=%d (%ld * %ld * %ld)\n",
+                                    is_prefill ? "prefill" : "decode", op->name,
+                                    to_offload, have_loaded, ne1, ne00, ne0);
+
+                if (!g_prefill_release_done && !is_prefill) {
+                    // release the prefill nodes with M > MAX_M_DECODE 
+                    timing_debug_printf("ggml-rknn: release prefill nodes with M > %d\n", DECODE_MAX_M);
+
+                    for (int i = 0; i < matmul_parts_AC_count; i++) {
+                        ggml_rknpu_matmul_part_AC *part = &matmul_parts_AC[i];
+                        if (part->M > DECODE_MAX_M && part->is_using == false) {
+                            // WARNING: set is_using to true to mark no more usage of this node 
+                            // cannot release matmul_parts_AC[i] directly, since it's a pointer to the array
+                            timing_debug_printf("ggml-rknn: release prefill node AC: (%d, %d, %d)\n", part->M, part->K, part->N);
+                            rknn_destroy_mem(part->ctx, part->A);
+                            rknn_destroy_mem(part->ctx, part->C);
+                            // rknn_matmul_destroy(part->ctx);
+                            part->is_using = true; 
+                        }
+                    }
+
+                    g_prefill_release_done = true;
+                    timing_debug_printf("ggml-rknn: release prefill done\n");
+                }
+            } else {
+                // ---- Slow path: warmup — do regex matching & populate caches ----
+                // Only check loaded_nodes during decode (and warmup-for-decode).
+                // loaded_nodes entries are decode-side resources; checking them
+                // during prefill has no functional effect (result is always false)
+                // but causes the scheduler to enter extra code paths and visit the
+                // RKNN backend during sched_reserve for TG graphs, which can
+                // create unnecessary graph splits and trigger re-allocations.
+                if (!is_prefill) {
+                    // Use user_loaded_nodes_set (the original config whitelist) so that
+                    // nodes dynamically inserted into loaded_nodes_set during warmup
+                    // (e.g. prefill-only nodes) do NOT accidentally appear as "loaded"
+                    // in the decode phase.
+                    if (user_loaded_nodes_set.find(std::string(op->name)) != user_loaded_nodes_set.end()) {
+                        have_loaded = true;
+                        timing_debug_printf("ggml-rknn: loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                    }
+                } 
+
+                // Select pattern list and cache based on prefill vs decode.
+                // During warmup: check BOTH pattern lists to offload all ops and
+                // initialize all kernels (prefill + decode).
+                const auto &patterns = is_prefill ? compiled_prefill_offload_patterns : compiled_offload_patterns;
+                auto &match_cache = is_prefill ? prefill_offload_match_cache : offload_match_cache;
+                const char *mode_str = is_warmup ? "warmup" : (is_prefill ? "prefill" : "decode");
+
+                // Always run pattern matching regardless of have_loaded.
+                // to_offload only means the weight is in NPU memory (possibly
+                // from warmup); it does NOT mean the op should run on NPU in
+                // every phase.  The offload patterns decide that.
+                if (!patterns.empty()) {
+                    std::string name_str(op->name);
+                    auto cache_it = match_cache.find(name_str);
+                    if (cache_it != match_cache.end()) {
+                        to_offload = cache_it->second;
+                        if (to_offload) {
+                            timing_debug_printf("ggml-rknn: %s offload node (cached): %s (%ld * %ld * %ld)\n", mode_str, op->name, ne1, ne00, ne0);
+                        }
+                    } else {
+                        for (const auto &pattern : patterns) {
+                            if (std::regex_match(name_str, pattern)) {
+                                to_offload = true;
+                                timing_debug_printf("ggml-rknn: %s offload node: %s (%ld * %ld * %ld)\n", mode_str, op->name, ne1, ne00, ne0);
+                                break;
+                            }
+                        }
+                        match_cache[name_str] = to_offload;
                     }
                 }
-            }
+
+                // During warmup, also check the OTHER pattern list to offload
+                // ops that belong to the other phase (prefill-only or decode-only).
+                if (is_warmup && !to_offload && !have_loaded) {
+                    const auto &other_patterns = is_prefill ? compiled_offload_patterns : compiled_prefill_offload_patterns;
+                    auto &other_cache = is_prefill ? offload_match_cache : prefill_offload_match_cache;
+                    if (!other_patterns.empty()) {
+                        std::string name_str(op->name);
+                        auto cache_it = other_cache.find(name_str);
+                        if (cache_it != other_cache.end()) {
+                            to_offload = cache_it->second;
+                        } else {
+                            for (const auto &pattern : other_patterns) {
+                                if (std::regex_match(name_str, pattern)) {
+                                    to_offload = true;
+                                    timing_debug_printf("ggml-rknn: warmup offload (other phase) node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                                    break;
+                                }
+                            }
+                            other_cache[name_str] = to_offload;
+                        }
+                    }
+                }
+            } // end slow path
 
             if (to_offload || have_loaded) {
                 if (ne00 > MAX_K) {
@@ -2173,11 +2680,26 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                     return false;
                 }
 
-                if (ne1 > 1) {
-                    // return false for no prefill
-                    result = rknn_config["npu_prefill"];
+                if (is_prefill) {
+                    // Prefill: only offload pattern-matched nodes (loaded_nodes
+                    // are decode-side entries and should not run in prefill).
+                    result = rknn_config["npu_prefill"] && to_offload;
+                } else if (is_warmup) {
+                    // During warmup, always offload matched ops regardless of
+                    // npu_prefill/npu_decode config — the goal is to initialize.
+                    result = true;
                 } else {
-                    result = rknn_config["npu_decode"];
+                    // Decode: use user_loaded_nodes_set as the authoritative whitelist
+                    // if it is non-empty (i.e. the user explicitly configured it).
+                    // Only nodes listed there will be offloaded; pattern-matched nodes
+                    // (to_offload) are intentionally excluded so that prefill-only or
+                    // warmup-loaded nodes are not accidentally offloaded in decode.
+                    // If user_loaded_nodes_set is empty, fall back to offload_nodes patterns.
+                    if (!user_loaded_nodes_set.empty()) {
+                        result = rknn_config["npu_decode"] && have_loaded;
+                    } else {
+                        result = rknn_config["npu_decode"] && to_offload;
+                    }
                 }
 
                 if (to_offload && result) {
@@ -2188,53 +2710,73 @@ static bool ggml_backend_rknn_device_supports_op(ggml_backend_dev_t dev, const s
                         type_size = 1;
                     }
 
-                    // for RKNN, A/B are type F16/I8, C is type F32/INT32
-                    uint64_t temp_allocated_bytes = (ne01 * ne00 + ne11 * ne10) * type_size + ne0 * ne1 * 4;
+                    // Permanent memory: only the weight matrix B (cached in src_w->extra).
+                    // A (activation) and C (output) are temporary per-inference buffers;
+                    // during decode M=1 so they are negligible. We must NOT include the
+                    // prefill M dimension here or the estimate explodes for large sequences.
+                    uint64_t weight_bytes = (uint64_t)ne01 * ne00 * type_size;
 
-                    timing_debug_printf("ggml-rknn: temp_allocated_bytes for %s: (%ld * %ld * %ld) %lu bytes\n", op->name, ne1, ne00, ne0, temp_allocated_bytes);
+                    timing_debug_printf("ggml-rknn: weight_bytes for %s: (%ld * %ld * %ld) weight=%lu bytes\n", op->name, ne1, ne00, ne0, weight_bytes);
                     timing_debug_printf("ggml-rknn: rknpu2_allocated_bytes: %lu bytes\n", rknpu2_allocated_bytes);
 
+                    // Only account for memory if the node has NOT been loaded yet.
+                    // supports_op is called multiple times (warmup reservation + actual
+                    // prefill + each decode step), so we must avoid double-counting.
+                    // NOTE: have_loaded is only set during decode (from user_loaded_nodes_set);
+                    // during prefill it is always false, so we also check loaded_nodes_set
+                    // to guard against duplicate push_back into the JSON array.
+                    if (!have_loaded) {
+                        static std::mutex rknpu2_allocated_bytes_mutex;
+                        {
+                            std::lock_guard<std::mutex> lock(rknpu2_allocated_bytes_mutex);
 
-                    static std::mutex rknpu2_allocated_bytes_mutex;
-                    {
-                        std::lock_guard<std::mutex> lock(rknpu2_allocated_bytes_mutex);
-                        temp_allocated_bytes += rknpu2_allocated_bytes;
+                            // Skip if already dynamically added (e.g. during an
+                            // earlier prefill supports_op call in the same warmup).
+                            if (loaded_nodes_set.count(std::string(op->name)) > 0) {
+                                timing_debug_printf("ggml-rknn: node already in loaded_nodes_set, skipping duplicate: %s\n", op->name);
+                            } else {
+                            uint64_t projected = rknpu2_allocated_bytes + weight_bytes;
 
+                            if (projected < MAX_RKNN_MEMORY) {
+                                loaded_nodes_set.insert(std::string(op->name));
+                                local_rknn_config["loaded_nodes"].push_back(op->name);
+                                rknpu2_allocated_bytes = projected;
 
-                        // printf("ggml-rknn: total allocated bytes: %lu\n", temp_allocated_bytes);
+                                timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
+                                #ifdef RKNN_MATMUL_DEBUG_TIMING_DETAILS
+                                    std::string loaded_nodes_str = "{";
+                                    for (auto it = loaded_nodes_set.begin(); it != loaded_nodes_set.end(); ++it) {
+                                        if (it != loaded_nodes_set.begin()) {loaded_nodes_str += ", ";}
+                                        loaded_nodes_str += "\"" + *it + "\"";
+                                    }
+                                    loaded_nodes_str += "}";
+                                    timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
+                                #endif
+                            }
+                            else {
+                                fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
+                                fprintf(stderr, "ggml-rknn: weight_bytes: %lu, already allocated: %lu, max memory: %llu\n", weight_bytes, rknpu2_allocated_bytes, MAX_RKNN_MEMORY);
+                                fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
+                                fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
 
-                        if (temp_allocated_bytes < MAX_RKNN_MEMORY) {
-                            //TODO: init this vector
-                            local_rknn_config["loaded_nodes"].push_back(op->name);
-                            loaded_nodes_set.insert(std::string(op->name));
-                            rknpu2_allocated_bytes = temp_allocated_bytes;
+                                local_rknn_config["offload_nodes"].clear();
+                                local_rknn_config["prefill_offload_nodes"].clear();
+                                compiled_offload_patterns.clear();
+                                offload_match_cache.clear();
+                                compiled_prefill_offload_patterns.clear();
+                                prefill_offload_match_cache.clear();
 
-                            timing_debug_printf("ggml-rknn: to offload -> loaded node: %s (%ld * %ld * %ld)\n", op->name, ne1, ne00, ne0);
-                            #ifdef RKNN_MATMUL_DEBUG_TIMING_DETAILS
-                                std::string loaded_nodes_str = "{";
-                                for (auto it = loaded_nodes_set.begin(); it != loaded_nodes_set.end(); ++it) {
-                                    if (it != loaded_nodes_set.begin()) {loaded_nodes_str += ", ";}
-                                    loaded_nodes_str += "\"" + *it + "\"";
-                                }
-                                loaded_nodes_str += "}";
-                                timing_debug_printf("ggml-rknn: loaded_nodes set: %s\n", loaded_nodes_str.c_str());
-                            #endif
+                                result = false;
+                            }
+                            } // end else (not-duplicate)
                         }
-                        else {
-                            fprintf(stderr, "ggml-rknn: requires too much memory when loading \"%s\" (%ld * %ld * %ld), resting offload_nodes! \n", op->name, ne1, ne00, ne0);
-                            fprintf(stderr, "ggml-rknn: allocated bytes: %lu, max memory: %llu\n", temp_allocated_bytes, MAX_RKNN_MEMORY);
-                            fprintf(stderr, "ggml-rknn: local_rknn_config: %s\n", local_rknn_config.dump().c_str());
-                            fprintf(stderr, "ggml-rknn: rknn_config: %s\n", rknn_config.dump().c_str());
-
-                            local_rknn_config["offload_nodes"].clear();
-
-                            result = false;
-                        }
+                    } else {
+                        timing_debug_printf("ggml-rknn: node already loaded, skipping memory accounting: %s\n", op->name);
                     }
                 }
             }
             // printf("ggml_backend_rknn_device_supports_op: %s, %d, %d, %d, %d\n", op->name, result, ne01, ne00, ne11); // n, k, m in rknn's notation
-            return result;
+           return result;
 
         }
 
@@ -2386,7 +2928,7 @@ int get_subN(rknn_matmul_type type){
 // MARK: Matmul sub
 extern "C" __attribute__((visibility("default"))) 
 void compute_submat_mul( // matrix A row
-                        int num_cores,
+                        int core_mask_bits,
                         ggml_tensor *src_i,
                         ggml_tensor *src_w,
                         ggml_tensor *dst,
@@ -2440,9 +2982,17 @@ void compute_submat_mul( // matrix A row
 
     std::vector<int> durations(10, 0);
 
+    // Encode decode + prefill ac_layout_perf into a bitmask: bit0=decode, bit1=prefill.
+    const bool decode_ac_perf  = match_ac_layout_perf_node(dst->name);
+    const bool prefill_ac_perf = match_ac_layout_perf_prefill_node(dst->name);
+    const int  ac_layout_perf_flags = (decode_ac_perf ? 1 : 0) | (prefill_ac_perf ? 2 : 0);
+
+    timing_debug_printf("ggml-rknn: ac_layout_perf flags: %s decode=%d prefill=%d\n",
+                        dst->name, decode_ac_perf, prefill_ac_perf);
+
     ggml_rknpu_matmul_pair rkpair;
     TIMEIT(
-        rkpair = create_matmul_pair(M, K, N, type, thread_idx, dst->name, num_cores);
+        rkpair = create_matmul_pair(M, K, N, type, thread_idx, dst->name, core_mask_bits, ac_layout_perf_flags);
     , &durations[0]);
     timing_debug_printf("ggml-rknn: create_matmul_pair %s:%d time: %d us\n", dst->name, thread_idx, durations[0]);
 
@@ -2458,11 +3008,13 @@ void compute_submat_mul( // matrix A row
 
     float * A_delta = NULL; // only for q8_0
 
-    // copy A to perf layout, memcpy B to kernel
+    // copy A to layout, memcpy B to kernel
+    // part_AC->ac_layout_perf reflects the actual AC_layout baked into this variant's ctx.
     {
+      if (part_AC->ac_layout_perf) {
         if (type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32){
             TIMEIT(
-                ggml_layout_to_perf_layout_A((float *)mat_A.pad_data, (rknpu2::float16 *)part_AC->A->virt_addr, A_pad_row_00, A_pad_col_00, part_AC->io_attr.A.dims[2]);
+                ggml_layout_to_perf_layout_A((float *)A_data, (rknpu2::float16 *)part_AC->A->virt_addr, A_pad_row_00, A_pad_col_00, part_AC->io_attr.A.dims[2]);
             , &durations[1]);
 
             if(!part_B->B_is_copied){
@@ -2474,7 +3026,7 @@ void compute_submat_mul( // matrix A row
             A_delta = new float[A_pad_row_00];
 
             TIMEIT(
-                norm_layout_to_perf_layout_A_custom_q8_0((float *)mat_A.pad_data, (int8_t *)part_AC->A->virt_addr, A_delta, A_pad_row_00, A_pad_col_00, part_AC->io_attr.A.dims[2])
+                norm_layout_to_perf_layout_A_custom_q8_0((float *)A_data, (int8_t *)part_AC->A->virt_addr, A_delta, A_pad_row_00, A_pad_col_00, part_AC->io_attr.A.dims[2])
             , &durations[1]);
 
             if(!part_B->B_is_copied){
@@ -2489,6 +3041,71 @@ void compute_submat_mul( // matrix A row
         }
 
         timing_debug_printf("ggml-rknn: copy A to perf layout, memcpy B to kernel time: %d %d us\n", durations[1], durations[2]);
+      } else {
+        if (type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32){
+            TIMEIT({
+                // NORM layout: A is [M, K] row-major FP16
+                // GGML column-major src1[K,M] and RKNN row-major A[M,K] share the same
+                // memory layout: element (m,k) is at offset m*K+k in both cases.
+                const float * src_f32 = (const float *)A_data;
+                uint16_t * dst_f16 = (uint16_t *)part_AC->A->virt_addr;
+                const int64_t total = M * K;
+                int64_t i = 0;
+#ifdef __ARM_NEON
+                for (; i + 7 < total; i += 8) {
+                    float32x4_t lo = vld1q_f32(src_f32 + i);
+                    float32x4_t hi = vld1q_f32(src_f32 + i + 4);
+                    float16x8_t f16 = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+                    vst1q_u16(dst_f16 + i, vreinterpretq_u16_f16(f16));
+                }
+#endif
+                for (; i < total; i++) {
+                    dst_f16[i] = GGML_FP32_TO_FP16(src_f32[i]);
+                }
+            }, &durations[1]);
+
+            if(!part_B->B_is_copied){
+                TIMEIT(
+                    B_memcpy_multithread((float16*)part_B->B->virt_addr, (float16*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
+                , &durations[2]);
+            }
+        } else if (type == RKNN_INT8_MM_INT8_TO_INT32){
+            A_delta = new float[A_pad_row_00];
+
+            TIMEIT({
+                // NORM layout: A is [M, K] row-major INT8
+                // Quantize each row: find max abs, compute scale, quantize
+                const float * src_f32 = (const float *)A_data;
+                int8_t * dst_i8 = (int8_t *)part_AC->A->virt_addr;
+                for (int64_t m = 0; m < M; m++) {
+                    const float * row = src_f32 + m * K;
+                    float amax = 0.0f;
+                    for (int64_t k = 0; k < K; k++) {
+                        amax = std::max(amax, std::abs(row[k]));
+                    }
+                    float scale = amax / 127.0f;
+                    A_delta[m] = scale;
+                    float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
+                    int8_t * dst_row = dst_i8 + m * K;
+                    for (int64_t k = 0; k < K; k++) {
+                        dst_row[k] = (int8_t)roundf(row[k] * iscale);
+                    }
+                }
+            }, &durations[1]);
+
+            if(!part_B->B_is_copied){
+                TIMEIT(
+                    B_memcpy_multithread((int8_t*)part_B->B->virt_addr, (int8_t*)mat_B.pad_data, B_pad_row_00, B_pad_col_00);
+                , &durations[2]);
+
+                #if GGML_RKNPU2_USE_OUTSIDE_ALLOC
+                dma_sync_cpu_to_device(part_B->B->fd);
+                #endif
+            }
+        }
+
+        timing_debug_printf("ggml-rknn: copy A to norm layout, memcpy B to kernel time: %d %d us\n", durations[1], durations[2]);
+      }
     }
 
     // set io to rknn
@@ -2556,28 +3173,50 @@ void compute_submat_mul( // matrix A row
 
     // rknn result back to ggml 
     {
-        //TODO: here assume c layout = perf 
-
+      if (part_AC->ac_layout_perf) {
         if (type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32){
-            // float* norm_layout_C = (float *)malloc(M * N * sizeof(float));
-            // int32_t N_remain = part_AC->io_attr.C.dims[0];
-            int32_t subN = part_AC->io_attr.C.dims[2];
-
-            TIMEIT(
-                perf_layout_to_ggml_layout_C((float *)part_AC->C->virt_addr, (float *)dst->data, M, N, ori_N, col_start, subN);
-                
+            TIMEIT({
+                perf_layout_to_ggml_layout_C((const float *)part_AC->C->virt_addr, (float *)dst->data, M, N, ori_N, col_start);
                 part_AC->is_using = false;
-            , &durations[8]);
+            }, &durations[8]);
 
         } else if (type == RKNN_INT8_MM_INT8_TO_INT32){
-            // float* norm_layout_C = new float[M * N];
-            int32_t subN = part_AC->io_attr.C.dims[2];
-
-            TIMEIT(
-                perf_layout_to_ggml_layout_C_q8_0((int32_t *)part_AC->C->virt_addr, (float *)dst->data, (float *)A_delta, (float *)B_data_delta, M, N, ori_N, col_start, subN);
+            TIMEIT({
+                perf_layout_to_ggml_layout_C_q8_0((const int32_t *)part_AC->C->virt_addr, (float *)dst->data, A_delta, (const float *)B_data_delta, M, N, ori_N, col_start);
                 part_AC->is_using = false;
-            , &durations[8]);
+            }, &durations[8]);
         }
+      } else {
+        if (type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32){
+            TIMEIT({
+                // C is [M, N] row-major FP32 → copy each row to dst at col_start offset
+                const float * c_data = (const float *)part_AC->C->virt_addr;
+                float * dst_data = (float *)dst->data;
+                for (int64_t m = 0; m < M; m++) {
+                    memcpy(dst_data + m * ori_N + col_start,
+                           c_data + m * N,
+                           N * sizeof(float));
+                }
+                part_AC->is_using = false;
+            }, &durations[8]);
+
+        } else if (type == RKNN_INT8_MM_INT8_TO_INT32){
+            TIMEIT({
+                // C is [M, N] row-major INT32 → dequantize and copy
+                const int32_t * c_data = (const int32_t *)part_AC->C->virt_addr;
+                float * dst_data = (float *)dst->data;
+                for (int64_t m = 0; m < M; m++) {
+                    float scale_a = A_delta[m];
+                    float * dst_row = dst_data + m * ori_N + col_start;
+                    const int32_t * c_row = c_data + m * N;
+                    for (int64_t n = 0; n < N; n++) {
+                        dst_row[n] = (float)c_row[n] * scale_a * ((float *)B_data_delta)[n];
+                    }
+                }
+                part_AC->is_using = false;
+            }, &durations[8]);
+        }
+      }
     }
     {
 
@@ -2599,7 +3238,7 @@ void compute_submat_mul( // matrix A row
         //     }
         // , &durations[9]);
 
-        timing_debug_printf("ggml-rknn: free prefill case duration: %d us\n", durations[9]);
+        // timing_debug_printf("ggml-rknn: free prefill case duration: %d us\n", durations[9]);
 
         #ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
             timer_p->find_kernel_time += durations[0];
@@ -2734,7 +3373,8 @@ float arraysCosineSimilarity_v(const T* arr1, const T* arr2, size_t size) {
     B: weight (F16) (2048, 8192) (K, N)
     C: output (F32) (1, 8192) (M, N)
 */
-static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_tensor * src_i, ggml_tensor * dst, rknn_matmul_type inference_type) {
+extern "C" __attribute__((visibility("default"))) 
+void ggml_rk_mul_mat(int *pt_npu_core_mask, ggml_backend_t backend, ggml_tensor * src_w, ggml_tensor * src_i, ggml_tensor * dst, rknn_matmul_type inference_type) {
     std::vector<std::thread> threads;
     int rknn_threads = (int)((ggml_backend_rknn_context * )backend->context)->rknn_threads;
     rknn_timing_helper *timer_p = ((ggml_backend_rknn_context *)backend->context)->timer;
@@ -2743,8 +3383,6 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
     int N = src_w->ne[1];
     int K = src_w->ne[0];
     // int M = src_i->ne[1];
-
-    int num_cores = 3;
 
     // convert F32 to F16
     // also do the column major to row major
@@ -2802,7 +3440,11 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
     
     timing_debug_printf("ggml-rknn: copying weights B duration: %d us\n", duration_b);
 
-    int threads_number = rknn_threads;
+    // Use popcount(core_mask) threads so each thread maps to exactly one unique NPU core.
+    // e.g. core_mask=0x6 (CORE_1+CORE_2) -> 2 threads: thread0->CORE_1, thread1->CORE_2
+    int threads_number = std::min(rknn_threads, __builtin_popcount((unsigned)*pt_npu_core_mask));
+    npu_core_debug_printf("[NPU_CORE] ggml_rk_mul_mat: rknn_threads=%d core_mask=0x%x (%s) -> effective threads=%d\n",
+                          rknn_threads, *pt_npu_core_mask, core_mask_to_str(*pt_npu_core_mask), threads_number);
 
     for(int t = 0; t < threads_number; t++){
         //TODO: assert sub_n is divisible by 16, consider the padding later 
@@ -2828,8 +3470,8 @@ static void ggml_rk_mul_mat(ggml_backend_t backend, ggml_tensor * src_w, ggml_te
         // void * B_compute_data = B_data;
 
         // run the thread;
-        threads.emplace_back([A_compute_data, B_compute_data, B_compute_data_delta, dst, col_start, col_end, t, inference_type, src_i, src_w, timer_p, num_cores](){
-            compute_submat_mul(num_cores, src_i, src_w, dst, A_compute_data, B_compute_data, B_compute_data_delta, col_start, col_end, t, inference_type, timer_p);
+        threads.emplace_back([A_compute_data, B_compute_data, B_compute_data_delta, dst, col_start, col_end, t, inference_type, src_i, src_w, timer_p, pt_npu_core_mask](){
+            compute_submat_mul(*pt_npu_core_mask, src_i, src_w, dst, A_compute_data, B_compute_data, B_compute_data_delta, col_start, col_end, t, inference_type, timer_p);
         });
     }
     // #ifdef RKNN_MATMUL_DEBUG
@@ -2855,6 +3497,9 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     }
 
     // func = ggml_rk_mul_mat;
+    int npu_core_mask = get_op_npu_core_mask(tensor->name, local_rknn_config["npu_core_mask"].get<int>());
+    npu_core_debug_printf("[NPU_CORE] ggml_rk_compute_forward: tensor=%s M=%lld K=%lld N=%lld core_mask=0x%x (%s)\n",
+                          tensor->name, (long long)tensor->ne[1], (long long)src0->ne[0], (long long)tensor->ne[0], npu_core_mask, core_mask_to_str(npu_core_mask));
     
     rknn_matmul_type matmul_type;
     matmul_type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
@@ -2872,10 +3517,30 @@ bool ggml_rk_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
     timing_debug_printf("ggml-rknn: starting matmul for %s size %ld x %ld x %ld\n", tensor->name, src0->ne[0], src0->ne[1], src1->ne[1]);
 
     TIMEIT(
-        ggml_rk_mul_mat(backend, tensor->src[0], tensor->src[1], tensor, matmul_type)
+        ggml_rk_mul_mat(&npu_core_mask, backend, tensor->src[0], tensor->src[1], tensor, matmul_type)
     , &((ggml_backend_rknn_context *)backend->context)->timer->total_run_time);
 
-    // printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) \n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0]);
+    // printf("ggml-rknn: processed tensor: %s, (%d,%d,%d) num_npu_cores: %d\n", tensor->name, tensor->ne[1], src0->ne[0], tensor->ne[0], num_npu_cores);
+
+    // Log current phase.
+#ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
+    {
+        const char *phase_str;
+        if (g_rknn_is_warmup.load(std::memory_order_relaxed)) {
+            phase_str = "WARMUP";
+        } else if (g_rknn_prefill_explicitly_set.load(std::memory_order_relaxed)) {
+            phase_str = g_rknn_is_prefill.load(std::memory_order_relaxed) ? "PREFILL" : "DECODE";
+        } else {
+            phase_str = (tensor->ne[1] > 1) ? "PREFILL(ne1)" : "DECODE(ne1)";
+        }
+    //     printf("ggml-rknn: [%s] %s  M=%lld K=%lld N=%lld  cores=%d\n",
+    //            phase_str, tensor->name,
+    //            (long long)tensor->ne[1], (long long)src0->ne[0], (long long)tensor->ne[0],
+    //            num_npu_cores);
+    // }
+    }
+#endif
+
 
     #ifdef RKNN_MATMUL_DEBUG_TIMING_INFO
         if (strstr(tensor->name, "output") != NULL || strcmp(tensor->name, "node_0") == 0){
