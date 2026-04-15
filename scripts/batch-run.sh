@@ -66,7 +66,7 @@ if [ "$mode" = "run" ] || [ "$mode" = "pipe" ] || [ "$mode" = "one" ]; then
 fi 
 
 if [ "$mode" = "check" ]; then
-    grep -E "Robert" logs/*pu* | cut -d' ' -f1,100-
+    grep -E "" logs/*pu* | cut -d' ' -f1,100-
 fi 
 
 if [ "$mode" = "parse" ]; then
