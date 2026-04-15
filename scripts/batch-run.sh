@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# LLAMA_CLI=/mnt/playground/sudeep/llama.cpp-rknn-debug/build_release/bin/llama-cli
 LLAMA_CLI=./build_release/bin/llama-cli
 BASE_DIR=/mnt/playground/npu_backend_paper_experiments
 MODELS_DIR=$BASE_DIR/models
