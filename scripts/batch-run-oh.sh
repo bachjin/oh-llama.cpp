@@ -1,6 +1,5 @@
 #!/data/local/tmp/bin/bash
 
-# LLAMA_CLI=/mnt/playground/sudeep/llama.cpp-rknn-debug/build_release/bin/llama-cli
 BASE_DIR=/data/oh-llama.cpp
 LLAMA_CLI=$BASE_DIR/build/bin/llama-cli
 MODELS_DIR=/data/models
